@@ -7,7 +7,14 @@ use super::discovery::discover_cdp_url;
 
 pub struct ChromeProcess {
     child: Child,
+    /// Empty string in pipe mode (see cdp_pipe_fds); the WebSocket URL otherwise.
     pub ws_url: String,
+    /// Parent ends of the `--remote-debugging-pipe` channel as raw owned fds
+    /// (write-to-chrome, read-from-chrome). Raw so the blocking launch thread
+    /// never touches the tokio reactor; browser.rs converts them to tokio
+    /// pipe halves inside the async context.
+    #[cfg(unix)]
+    pub cdp_pipe_fds: Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>,
     temp_user_data_dir: Option<PathBuf>,
     /// On Unix, the process group ID used to kill the entire Chrome process tree.
     #[cfg(unix)]
@@ -329,6 +336,10 @@ pub struct LaunchOptions {
     /// Restrict WebRTC to proxied transports so direct UDP cannot bypass the
     /// HTTP domain filter. Enabled automatically with `--allowed-domains`.
     pub restrict_webrtc: bool,
+    /// On unix, speak CDP over Chrome's `--remote-debugging-pipe` (fds 3/4)
+    /// instead of a loopback TCP port, so the session has no unauthenticated
+    /// TCP listener (AGENT_BROWSER_CDP_PIPE). Ignored on non-unix platforms.
+    pub cdp_pipe: bool,
 }
 
 impl Default for LaunchOptions {
@@ -355,6 +366,7 @@ impl Default for LaunchOptions {
             webgpu: false,
             no_xvfb: false,
             restrict_webrtc: false,
+            cdp_pipe: false,
         }
     }
 }
@@ -394,8 +406,14 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         }
     }
 
+    let debug_flag = if cfg!(unix) && options.cdp_pipe {
+        // CDP over fds 3/4: no DevToolsActivePort, no TCP listener.
+        "--remote-debugging-pipe".to_string()
+    } else {
+        "--remote-debugging-port=0".to_string()
+    };
     let mut args = vec![
-        "--remote-debugging-port=0".to_string(),
+        debug_flag,
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
         "--disable-background-networking".to_string(),
@@ -648,6 +666,49 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
         cmd.env("XAUTHORITY", &x.auth_file);
     }
 
+    // CDP-over-pipe: create both channels before spawning so the child ends
+    // can be dup2'd onto fds 3/4 between fork and exec. O_CLOEXEC on every
+    // end: dup2 clears it on the child's 3/4, exec closes the originals, and
+    // the parent ends never leak into any other child.
+    #[cfg(unix)]
+    struct PipeEnds {
+        parent_write: std::os::fd::OwnedFd,
+        parent_read: std::os::fd::OwnedFd,
+        child_read: std::os::fd::OwnedFd,
+        child_write: std::os::fd::OwnedFd,
+    }
+    #[cfg(unix)]
+    let mut pipe_ends: Option<PipeEnds> = None;
+    #[cfg(unix)]
+    if options.cdp_pipe {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let mut to_chrome = [-1i32; 2]; // chrome reads commands on fd 3
+        let mut from_chrome = [-1i32; 2]; // chrome writes messages on fd 4
+                                          // SAFETY: pipe2 on fresh arrays; fds wrapped in OwnedFd immediately.
+        let ok = unsafe {
+            libc::pipe2(to_chrome.as_mut_ptr(), libc::O_CLOEXEC) == 0
+                && libc::pipe2(from_chrome.as_mut_ptr(), libc::O_CLOEXEC) == 0
+        };
+        if !ok {
+            for fd in to_chrome.iter().chain(from_chrome.iter()) {
+                if *fd >= 0 {
+                    unsafe { libc::close(*fd) };
+                }
+            }
+            cleanup_temp_dir(&temp_user_data_dir);
+            return Err("Failed to create CDP pipe pair".to_string());
+        }
+        // SAFETY: fds are freshly created and owned by nothing else.
+        pipe_ends = Some(unsafe {
+            PipeEnds {
+                parent_write: OwnedFd::from_raw_fd(to_chrome[1]),
+                parent_read: OwnedFd::from_raw_fd(from_chrome[0]),
+                child_read: OwnedFd::from_raw_fd(to_chrome[0]),
+                child_write: OwnedFd::from_raw_fd(from_chrome[1]),
+            }
+        });
+    }
+
     // Place Chrome in its own process group so we can kill the entire tree
     // (main process + GPU/renderer/utility/crashpad helpers) with a single
     // killpg(), preventing orphaned processes (issue #1113).
@@ -659,11 +720,40 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
+        let pipe_child_fds = pipe_ends.as_ref().map(|p| {
+            use std::os::fd::AsRawFd;
+            (p.child_read.as_raw_fd(), p.child_write.as_raw_fd())
+        });
         // SAFETY: pre_exec runs between fork() and exec() in the child.
-        // setpgid is async-signal-safe.
+        // setpgid, dup2 and fcntl are async-signal-safe.
         unsafe {
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
                 libc::setpgid(0, 0);
+                if let Some((read_fd, mut write_fd)) = pipe_child_fds {
+                    // Chrome expects commands on fd 3 and writes on fd 4.
+                    // dup2 clears O_CLOEXEC on the duplicate; two edge cases:
+                    // the write end sitting on fd 3 would be clobbered by the
+                    // first dup2 (move it up first), and dup2(n, n) is a no-op
+                    // that KEEPS O_CLOEXEC (clear it by hand).
+                    if write_fd == 3 {
+                        write_fd = libc::fcntl(write_fd, libc::F_DUPFD_CLOEXEC, 5);
+                        if write_fd < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    for (src, dst) in [(read_fd, 3), (write_fd, 4)] {
+                        if src == dst {
+                            let flags = libc::fcntl(dst, libc::F_GETFD);
+                            if flags < 0
+                                || libc::fcntl(dst, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                            {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                        } else if libc::dup2(src, dst) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                }
                 Ok(())
             });
         }
@@ -674,8 +764,34 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
         format!("Failed to launch Chrome at {:?}: {}", chrome_path, e)
     })?;
 
+    // The child inherited copies of its pipe ends across fork(); the parent's
+    // duplicates of those two ends are no longer needed.
+    #[cfg(unix)]
+    let pipe_parent_ends = pipe_ends.map(|p| {
+        drop(p.child_read);
+        drop(p.child_write);
+        (p.parent_write, p.parent_read)
+    });
+
     // Shared overall deadline so we don't double-wait (poll + stderr fallback).
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
+
+    // Pipe mode: there is no DevToolsActivePort and no WebSocket URL; the
+    // CDP client speaks over the inherited fds. Readiness is the first
+    // response on the pipe, so no waiting is needed here.
+    #[cfg(unix)]
+    if let Some((parent_write, parent_read)) = pipe_parent_ends {
+        let _ = deadline;
+        return Ok(ChromeProcess {
+            ws_url: String::new(),
+            cdp_pipe_fds: Some((parent_write, parent_read)),
+            temp_user_data_dir,
+            pgid: Some(child.id() as i32),
+            #[cfg(target_os = "linux")]
+            xvfb,
+            child,
+        });
+    }
 
     // Primary path: use DevToolsActivePort written into user-data-dir.
     // This is more reliable on Windows than scraping stderr for "DevTools listening on ...",
@@ -715,6 +831,8 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
     Ok(ChromeProcess {
         child,
         ws_url,
+        #[cfg(unix)]
+        cdp_pipe_fds: None,
         temp_user_data_dir,
         #[cfg(unix)]
         pgid,
@@ -2032,6 +2150,8 @@ mod tests {
             let _process = ChromeProcess {
                 child,
                 ws_url: String::new(),
+                #[cfg(unix)]
+                cdp_pipe_fds: None,
                 temp_user_data_dir: Some(dir.clone()),
                 #[cfg(unix)]
                 pgid: None,

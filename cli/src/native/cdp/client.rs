@@ -26,23 +26,95 @@ pub struct RawCdpMessage {
     pub session_id: Option<String>,
 }
 
+type WsSink = futures_util::stream::SplitSink<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    Message,
+>;
+
+/// Outgoing CDP transport. WebSocket for launched-with-port / attach / remote
+/// browsers; on unix, optionally Chrome's `--remote-debugging-pipe` (fd 3/4,
+/// NUL-delimited JSON) so a session needs no TCP listener at all.
+pub enum CdpSink {
+    Ws(WsSink),
+    #[cfg(unix)]
+    Pipe(tokio::net::unix::pipe::Sender),
+}
+
+impl CdpSink {
+    async fn send_text(&mut self, text: String) -> Result<(), String> {
+        match self {
+            CdpSink::Ws(tx) => tx
+                .send(Message::Text(text))
+                .await
+                .map_err(|e| format!("Failed to send CDP command: {}", e)),
+            #[cfg(unix)]
+            CdpSink::Pipe(tx) => {
+                use tokio::io::AsyncWriteExt;
+                let mut framed = text.into_bytes();
+                framed.push(0);
+                tx.write_all(&framed)
+                    .await
+                    .map_err(|e| format!("Failed to send CDP command over pipe: {}", e))
+            }
+        }
+    }
+}
+
+type SinkTx = Arc<Mutex<CdpSink>>;
+
 pub struct CdpClient {
-    ws_tx: Arc<
-        Mutex<
-            futures_util::stream::SplitSink<
-                tokio_tungstenite::WebSocketStream<
-                    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-                >,
-                Message,
-            >,
-        >,
-    >,
+    ws_tx: SinkTx,
     next_id: AtomicU64,
     pending: PendingMap,
     event_tx: broadcast::Sender<CdpEvent>,
     raw_tx: broadcast::Sender<RawCdpMessage>,
     _reader_handle: tokio::task::JoinHandle<()>,
     _keepalive_handle: tokio::task::JoinHandle<()>,
+}
+
+/// Dispatch one incoming CDP text message: raw broadcast for the inspect
+/// proxy, then either resolve the pending command or broadcast the event.
+/// Shared by the WebSocket and pipe reader loops.
+async fn process_incoming(
+    msg: &str,
+    pending: &PendingMap,
+    event_tx: &broadcast::Sender<CdpEvent>,
+    raw_tx: &broadcast::Sender<RawCdpMessage>,
+) {
+    // Broadcast raw message for inspect proxy subscribers before typed parse,
+    // so messages with negative IDs (used by the inspect proxy) are still delivered.
+    if raw_tx.receiver_count() > 0 {
+        let session_id = serde_json::from_str::<serde_json::Value>(msg)
+            .ok()
+            .and_then(|v| v.get("sessionId")?.as_str().map(String::from));
+        let _ = raw_tx.send(RawCdpMessage {
+            text: msg.to_string(),
+            session_id,
+        });
+    }
+
+    let parsed: CdpMessage = match serde_json::from_str(msg) {
+        Ok(m) => m,
+        // Expected for inspect proxy messages with negative IDs
+        // (CdpMessage.id is u64); handled via raw broadcast above.
+        Err(_) => return,
+    };
+
+    if let Some(id) = parsed.id {
+        // Response to a command
+        let mut pending = pending.lock().await;
+        if let Some(tx) = pending.remove(&id) {
+            let _ = tx.send(parsed);
+        }
+    } else if let Some(ref method) = parsed.method {
+        // Event
+        let event = CdpEvent {
+            method: method.clone(),
+            params: parsed.params.clone().unwrap_or(Value::Null),
+            session_id: parsed.session_id.clone(),
+        };
+        let _ = event_tx.send(event);
+    }
 }
 
 impl CdpClient {
@@ -84,7 +156,7 @@ impl CdpClient {
         enable_tcp_keepalive(ws_stream.get_ref());
 
         let (ws_tx, mut ws_rx) = ws_stream.split();
-        let ws_tx = Arc::new(Mutex::new(ws_tx));
+        let ws_tx: SinkTx = Arc::new(Mutex::new(CdpSink::Ws(ws_tx)));
 
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let (event_tx, _) = broadcast::channel(4096);
@@ -128,40 +200,7 @@ impl CdpClient {
                     }
                 };
 
-                // Broadcast raw message for inspect proxy subscribers before typed parse,
-                // so messages with negative IDs (used by the inspect proxy) are still delivered.
-                if raw_tx_clone.receiver_count() > 0 {
-                    let session_id = serde_json::from_str::<serde_json::Value>(&msg)
-                        .ok()
-                        .and_then(|v| v.get("sessionId")?.as_str().map(String::from));
-                    let _ = raw_tx_clone.send(RawCdpMessage {
-                        text: msg.clone(),
-                        session_id,
-                    });
-                }
-
-                let parsed: CdpMessage = match serde_json::from_str(&msg) {
-                    Ok(m) => m,
-                    // Expected for inspect proxy messages with negative IDs
-                    // (CdpMessage.id is u64); handled via raw broadcast above.
-                    Err(_) => continue,
-                };
-
-                if let Some(id) = parsed.id {
-                    // Response to a command
-                    let mut pending = pending_clone.lock().await;
-                    if let Some(tx) = pending.remove(&id) {
-                        let _ = tx.send(parsed);
-                    }
-                } else if let Some(ref method) = parsed.method {
-                    // Event
-                    let event = CdpEvent {
-                        method: method.clone(),
-                        params: parsed.params.clone().unwrap_or(Value::Null),
-                        session_id: parsed.session_id.clone(),
-                    };
-                    let _ = event_tx_clone.send(event);
-                }
+                process_incoming(&msg, &pending_clone, &event_tx_clone, &raw_tx_clone).await;
             }
 
             // Reader loop exited (connection closed or error). Drop all pending
@@ -186,7 +225,8 @@ impl CdpClient {
                     _ = cancel_rx.changed() => break,
                 }
                 let mut tx = keepalive_tx.lock().await;
-                if tx.send(Message::Ping(Vec::new())).await.is_err() {
+                let CdpSink::Ws(ref mut ws) = *tx else { break };
+                if ws.send(Message::Ping(Vec::new())).await.is_err() {
                     break;
                 }
             }
@@ -201,6 +241,68 @@ impl CdpClient {
             _reader_handle: reader_handle,
             _keepalive_handle: keepalive_handle,
         })
+    }
+
+    /// Connect over Chrome's `--remote-debugging-pipe` (fds 3/4 of the Chrome
+    /// child): NUL-delimited JSON, no WebSocket framing, no TCP listener.
+    /// The keepalive task is a no-op; a local pipe has no idle middleboxes.
+    #[cfg(unix)]
+    pub fn connect_pipe(
+        writer: tokio::net::unix::pipe::Sender,
+        reader: tokio::net::unix::pipe::Receiver,
+    ) -> Self {
+        use tokio::io::AsyncReadExt;
+
+        let ws_tx: SinkTx = Arc::new(Mutex::new(CdpSink::Pipe(writer)));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let (event_tx, _) = broadcast::channel(4096);
+        let (raw_tx, _) = broadcast::channel(4096);
+
+        let pending_clone = pending.clone();
+        let event_tx_clone = event_tx.clone();
+        let raw_tx_clone = raw_tx.clone();
+
+        let reader_handle = tokio::spawn(async move {
+            let mut reader = reader;
+            let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+            let mut chunk = [0u8; 64 * 1024];
+            loop {
+                let n = match reader.read(&mut chunk).await {
+                    Ok(0) => break, // Chrome closed its end
+                    Ok(n) => n,
+                    Err(e) => {
+                        if std::env::var("AGENT_BROWSER_DEBUG").is_ok() {
+                            let _ = writeln!(std::io::stderr(), "[cdp] pipe read error: {}", e);
+                        }
+                        break;
+                    }
+                };
+                buf.extend_from_slice(&chunk[..n]);
+                // Messages are NUL-delimited; the tail (if any) stays buffered.
+                while let Some(pos) = buf.iter().position(|&b| b == 0) {
+                    let rest = buf.split_off(pos + 1);
+                    buf.pop(); // drop the NUL
+                    if let Ok(msg) = std::str::from_utf8(&buf) {
+                        process_incoming(msg, &pending_clone, &event_tx_clone, &raw_tx_clone).await;
+                    }
+                    buf = rest;
+                }
+            }
+            // Pipe closed: fail pending callers immediately, as the WS path does.
+            pending_clone.lock().await.clear();
+        });
+
+        let keepalive_handle = tokio::spawn(async {});
+
+        Self {
+            ws_tx,
+            next_id: AtomicU64::new(1),
+            pending,
+            event_tx,
+            raw_tx,
+            _reader_handle: reader_handle,
+            _keepalive_handle: keepalive_handle,
+        }
     }
 
     pub async fn send_command(
@@ -230,10 +332,7 @@ impl CdpClient {
 
         {
             let mut ws_tx = self.ws_tx.lock().await;
-            ws_tx
-                .send(Message::Text(json))
-                .await
-                .map_err(|e| format!("Failed to send CDP command: {}", e))?;
+            ws_tx.send_text(json).await?;
         }
 
         let response = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
@@ -317,48 +416,28 @@ impl CdpClient {
             .map_err(|e| format!("Failed to serialize CDP command: {}", e))?;
 
         let mut ws_tx = self.ws_tx.lock().await;
-        ws_tx
-            .send(Message::Text(json))
-            .await
-            .map_err(|e| format!("Failed to send CDP command: {}", e))
+        ws_tx.send_text(json).await
     }
 
-    /// Send raw JSON through the WebSocket without tracking a response.
+    /// Send raw JSON through the transport without tracking a response.
     /// Used by the inspect proxy to forward DevTools frontend messages.
     pub async fn send_raw(&self, json: String) -> Result<(), String> {
         let mut ws_tx = self.ws_tx.lock().await;
-        ws_tx
-            .send(Message::Text(json))
-            .await
-            .map_err(|e| format!("Failed to send raw CDP message: {}", e))
+        ws_tx.send_text(json).await
     }
 }
-
-type WsTx = Arc<
-    Mutex<
-        futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            Message,
-        >,
-    >,
->;
 
 /// Lightweight handle for the inspect WebSocket proxy, holding only
 /// the cloneable parts of CdpClient needed for bidirectional message forwarding.
 pub struct InspectProxyHandle {
-    ws_tx: WsTx,
+    ws_tx: SinkTx,
     raw_tx: broadcast::Sender<RawCdpMessage>,
 }
 
 impl InspectProxyHandle {
     pub async fn send_raw(&self, json: String) -> Result<(), String> {
         let mut ws_tx = self.ws_tx.lock().await;
-        ws_tx
-            .send(Message::Text(json))
-            .await
-            .map_err(|e| format!("Failed to send raw CDP message: {}", e))
+        ws_tx.send_text(json).await
     }
 
     pub fn subscribe_raw(&self) -> broadcast::Receiver<RawCdpMessage> {

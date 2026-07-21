@@ -3324,7 +3324,18 @@ fn launch_options_from_env() -> LaunchOptions {
         no_xvfb: no_xvfb_from_env(),
         restrict_webrtc: env::var("AGENT_BROWSER_ALLOWED_DOMAINS")
             .is_ok_and(|domains| !domains.trim().is_empty()),
+        cdp_pipe: cdp_pipe_from_env(),
     }
+}
+
+/// AGENT_BROWSER_CDP_PIPE=1: on unix, launch Chrome with
+/// --remote-debugging-pipe so the session exposes no CDP TCP listener.
+/// Ignored on non-unix platforms (Chrome pipe mode uses fds 3/4).
+fn cdp_pipe_from_env() -> bool {
+    cfg!(unix)
+        && env::var("AGENT_BROWSER_CDP_PIPE")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false)
 }
 
 fn hide_scrollbars_from_env() -> bool {
@@ -3785,6 +3796,11 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         webgpu: webgpu_from_launch_cmd(cmd),
         no_xvfb: no_xvfb_from_launch_cmd(cmd),
         restrict_webrtc,
+        cdp_pipe: cmd
+            .get("cdpPipe")
+            .and_then(|v| v.as_bool())
+            .map(|v| v && cfg!(unix))
+            .unwrap_or_else(cdp_pipe_from_env),
     };
 
     state.plugin_init_scripts.clear();

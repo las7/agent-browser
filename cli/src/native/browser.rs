@@ -348,7 +348,7 @@ impl BrowserManager {
         let color_scheme = options.color_scheme.clone();
         let download_path = options.download_path.clone();
 
-        let (ws_url, process) = match engine {
+        let (ws_url, mut process) = match engine {
             "lightpanda" => {
                 let lp_options = LightpandaLaunchOptions {
                     executable_path: options.executable_path.clone(),
@@ -371,6 +371,25 @@ impl BrowserManager {
         let manager = if engine == "lightpanda" {
             initialize_lightpanda_manager(ws_url, process).await?
         } else {
+            // Pipe mode: the launch returned the parent ends of Chrome's
+            // --remote-debugging-pipe channel instead of a WebSocket URL.
+            // Convert to tokio pipe halves here, inside the async context.
+            #[cfg(unix)]
+            let pipe_halves = match process {
+                BrowserProcess::Chrome(ref mut chrome) => chrome.cdp_pipe_fds.take(),
+                _ => None,
+            };
+            #[cfg(unix)]
+            let client = if let Some((write_fd, read_fd)) = pipe_halves {
+                let writer = tokio::net::unix::pipe::Sender::from_owned_fd(write_fd)
+                    .map_err(|e| format!("Failed to adopt CDP pipe writer: {}", e))?;
+                let reader = tokio::net::unix::pipe::Receiver::from_owned_fd(read_fd)
+                    .map_err(|e| format!("Failed to adopt CDP pipe reader: {}", e))?;
+                Arc::new(CdpClient::connect_pipe(writer, reader))
+            } else {
+                Arc::new(CdpClient::connect(&ws_url).await?)
+            };
+            #[cfg(not(unix))]
             let client = Arc::new(CdpClient::connect(&ws_url).await?);
             let mut manager = Self {
                 client,
