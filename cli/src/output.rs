@@ -674,8 +674,18 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
         // Errors
         if let Some(errors) = data.get("errors").and_then(|v| v.as_array()) {
             for err in errors {
-                let msg = err.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                println!("{} {}", color::error_indicator(), msg);
+                // Page errors arrive with the message (and stack) in `text`;
+                // keep `message` as a fallback for older daemons.
+                let msg = err
+                    .get("text")
+                    .or_else(|| err.get("message"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let mut lines = msg.lines();
+                println!("{} {}", color::error_indicator(), lines.next().unwrap_or(""));
+                for line in lines {
+                    println!("    {}", line.trim_start());
+                }
             }
             return;
         }
