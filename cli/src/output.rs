@@ -3418,6 +3418,7 @@ Debug:
   highlight <sel>            Highlight element
   inspect                    Open Chrome DevTools for the active page
   clipboard <op> [text]      Read/write clipboard (read, write, copy, paste)
+  dialog <action> [text]     Handle a blocking JS dialog (accept, dismiss, status)
 
 Streaming:
   stream enable [--port <n>] Start runtime WebSocket streaming for this session
