@@ -26,6 +26,7 @@ use super::diff;
 use super::element::RefMap;
 use super::inspect_server::InspectServer;
 use super::interaction;
+use super::journal::{self, Journal};
 use super::network::{self, DomainFilter, EventTracker};
 use super::policy::{ActionPolicy, ConfirmActions, PolicyResult};
 use super::providers;
@@ -406,10 +407,18 @@ pub struct DaemonState {
     active_provider_session: Option<ActiveProviderSession>,
     /// Actions already approved while replaying a confirmed command.
     confirmed_policy_actions: HashSet<String>,
+    /// Structured event journal, opt-in via AGENT_BROWSER_JOURNAL_DIR.
+    /// Independent of the stream server (works under AGENT_BROWSER_NO_STREAM).
+    pub journal: Option<Arc<Journal>>,
+    /// Background task that tees CDP events into the journal.
+    journal_handler_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl DaemonState {
     pub fn new() -> Self {
+        let session_id =
+            env::var("AGENT_BROWSER_SESSION").unwrap_or_else(|_| "default".to_string());
+        let journal = Journal::from_env(&session_id);
         Self {
             browser: None,
             appium: None,
@@ -440,7 +449,7 @@ impl DaemonState {
             restore_saved_path: None,
             last_command_finished: None,
             last_autosave_attempt: None,
-            session_id: env::var("AGENT_BROWSER_SESSION").unwrap_or_else(|_| "default".to_string()),
+            session_id,
             tracing_state: TracingState::new(),
             recording_state: RecordingState::new(),
             event_rx: None,
@@ -455,7 +464,10 @@ impl DaemonState {
             inspect_server: None,
             routes: Arc::new(RwLock::new(Vec::new())),
             tracked_requests: Vec::new(),
-            request_tracking: false,
+            // With a journal enabled, network capture is auto-armed (like it
+            // is for the stream server below) so `network requests` works
+            // without an explicit arming command even under NO_STREAM=1.
+            request_tracking: journal.is_some(),
             active_frame_id: None,
             iframe_sessions: HashMap::new(),
             origin_headers: Arc::new(RwLock::new(HashMap::new())),
@@ -485,6 +497,8 @@ impl DaemonState {
             plugin_init_scripts: Vec::new(),
             active_provider_session: None,
             confirmed_policy_actions: HashSet::new(),
+            journal,
+            journal_handler_task: None,
         }
     }
 
@@ -521,6 +535,43 @@ impl DaemonState {
         if let Some(ref browser) = self.browser {
             self.event_rx = Some(browser.client.subscribe());
         }
+        // The journal tee follows the same lifecycle as this subscription:
+        // every call site pairs subscribe_to_browser_events with
+        // start_fetch_handler/start_dialog_handler after a (re)launch, so
+        // restarting the tee here covers all of them.
+        self.start_journal_handler();
+    }
+
+    /// Start the background task that tees CDP events (console, page errors,
+    /// main-frame navigations, dialogs, document/xhr/fetch responses) into
+    /// the structured journal. Modeled on `start_fetch_handler`: a separate
+    /// `CdpClient::subscribe()` receiver, independent of the drain in
+    /// `apply_drained_events`.
+    fn start_journal_handler(&mut self) {
+        // Abort any existing handler.
+        if let Some(task) = self.journal_handler_task.take() {
+            task.abort();
+        }
+
+        let Some(ref journal) = self.journal else {
+            return;
+        };
+        let Some(ref browser) = self.browser else {
+            return;
+        };
+
+        let journal = Arc::clone(journal);
+        let mut rx = browser.client.subscribe();
+
+        self.journal_handler_task = Some(tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => journal::record_cdp_event(&journal, &event),
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+        }));
     }
 
     /// Start the background task that processes Fetch.requestPaused and
@@ -1646,6 +1697,9 @@ impl Drop for DaemonState {
         if let Some(task) = self.dialog_handler_task.take() {
             task.abort();
         }
+        if let Some(task) = self.journal_handler_task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -2015,29 +2069,33 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         return resp;
     }
 
-    if let Some(ref server) = state.stream_server {
-        let mut broadcast_cmd;
-        let has_internal_fields = cmd.get("plugins").is_some()
-            || cmd.get("restoreKey").is_some()
-            || cmd.get("restoreSave").is_some()
-            || cmd.get("restoreCheckUrl").is_some()
-            || cmd.get("restoreCheckText").is_some()
-            || cmd.get("restoreCheckFn").is_some();
-        let cmd_for_broadcast = if has_internal_fields {
-            broadcast_cmd = cmd.clone();
-            if let Some(obj) = broadcast_cmd.as_object_mut() {
-                obj.remove("plugins");
-                obj.remove("restoreKey");
-                obj.remove("restoreSave");
-                obj.remove("restoreCheckUrl");
-                obj.remove("restoreCheckText");
-                obj.remove("restoreCheckFn");
-            }
-            &broadcast_cmd
-        } else {
-            cmd
-        };
-        server.broadcast_command(action, &id, cmd_for_broadcast);
+    if state.stream_server.is_some() || state.journal.is_some() {
+        // Strip internal fields (same set for the stream broadcast and the
+        // journal record).
+        let mut broadcast_cmd = cmd.clone();
+        if let Some(obj) = broadcast_cmd.as_object_mut() {
+            obj.remove("plugins");
+            obj.remove("restoreKey");
+            obj.remove("restoreSave");
+            obj.remove("restoreCheckUrl");
+            obj.remove("restoreCheckText");
+            obj.remove("restoreCheckFn");
+        }
+        if let Some(ref server) = state.stream_server {
+            server.broadcast_command(action, &id, &broadcast_cmd);
+        }
+        // Journaled unconditionally — the journal does not depend on the
+        // stream server (which is absent under AGENT_BROWSER_NO_STREAM=1).
+        if let Some(ref journal) = state.journal {
+            let mut params = broadcast_cmd;
+            journal::elide_long_strings(&mut params);
+            journal.write(json!({
+                "type": "command",
+                "id": id,
+                "action": action,
+                "params": params,
+            }));
+        }
     }
 
     // Drain and apply pending CDP events (console, errors, screencast frames, target lifecycle)
@@ -2100,6 +2158,14 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                 cmd: cmd.clone(),
                 approved_actions: state.confirmed_policy_actions.iter().cloned().collect(),
             });
+            if let Some(ref journal) = state.journal {
+                journal.write(json!({
+                    "type": "confirmation",
+                    "id": id,
+                    "action": policy_action,
+                    "status": "pending",
+                }));
+            }
             return json!({
                 "id": id,
                 "success": true,
@@ -2125,6 +2191,14 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                         cmd: cmd.clone(),
                         approved_actions: state.confirmed_policy_actions.iter().cloned().collect(),
                     });
+                    if let Some(ref journal) = state.journal {
+                        journal.write(json!({
+                            "type": "confirmation",
+                            "id": id,
+                            "action": policy_action,
+                            "status": "pending",
+                        }));
+                    }
                     return json!({
                         "id": id,
                         "success": true,
@@ -2449,15 +2523,38 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         }
     }
 
+    let duration_ms = cmd_start.elapsed().as_millis() as u64;
+    // The response envelope carries `success` (bool) — there is no
+    // `status` key, so the old string comparison reported success:false
+    // for every command.
+    let success = resp
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if let Some(ref journal) = state.journal {
+        let mut record = json!({
+            "type": "result",
+            "id": id,
+            "action": action,
+            "success": success,
+            "duration_ms": duration_ms,
+        });
+        let obj = record.as_object_mut().expect("literal object");
+        if success {
+            let mut data = resp.get("data").cloned().unwrap_or(Value::Null);
+            journal::elide_long_strings(&mut data);
+            obj.insert("data".to_string(), data);
+        } else {
+            obj.insert(
+                "error".to_string(),
+                resp.get("error").cloned().unwrap_or(Value::Null),
+            );
+        }
+        journal.write(record);
+    }
+
     if let Some(ref server) = state.stream_server {
-        let duration_ms = cmd_start.elapsed().as_millis() as u64;
-        // The response envelope carries `success` (bool) — there is no
-        // `status` key, so the old string comparison reported success:false
-        // for every command.
-        let success = resp
-            .get("success")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
         let data = resp.get("data").cloned().unwrap_or(Value::Null);
         server.broadcast_result(&id, action, success, &data, duration_ms);
 
@@ -10121,6 +10218,16 @@ async fn handle_confirm(_cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     if !approved_actions.iter().any(|a| a == &pending.action) {
         approved_actions.push(pending.action.clone());
     }
+    if let Some(ref journal) = state.journal {
+        journal.write(json!({
+            "type": "confirmation",
+            // id of the original (confirmed) command, when it carried one.
+            "id": pending.cmd.get("id").cloned().unwrap_or(Value::Null),
+            "action": pending.action,
+            "status": "confirmed",
+        }));
+    }
+
     let previous_confirmed = std::mem::replace(
         &mut state.confirmed_policy_actions,
         approved_actions.into_iter().collect(),
@@ -10136,6 +10243,16 @@ async fn handle_deny(_cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         .pending_confirmation
         .take()
         .ok_or("No pending confirmation")?;
+
+    if let Some(ref journal) = state.journal {
+        journal.write(json!({
+            "type": "confirmation",
+            // id of the original (denied) command, when it carried one.
+            "id": pending.cmd.get("id").cloned().unwrap_or(Value::Null),
+            "action": pending.action,
+            "status": "denied",
+        }));
+    }
 
     Ok(json!({ "denied": true, "action": pending.action }))
 }
