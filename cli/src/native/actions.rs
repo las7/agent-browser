@@ -2451,10 +2451,13 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
 
     if let Some(ref server) = state.stream_server {
         let duration_ms = cmd_start.elapsed().as_millis() as u64;
+        // The response envelope carries `success` (bool) — there is no
+        // `status` key, so the old string comparison reported success:false
+        // for every command.
         let success = resp
-            .get("status")
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| s == "success");
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let data = resp.get("data").cloned().unwrap_or(Value::Null);
         server.broadcast_result(&id, action, success, &data, duration_ms);
 
