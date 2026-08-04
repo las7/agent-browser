@@ -701,7 +701,10 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
         // Network requests
         if let Some(requests) = data.get("requests").and_then(|v| v.as_array()) {
             if requests.is_empty() {
-                println!("No requests captured");
+                println!(
+                    "No requests captured — capture arms on the first `network requests` call; \
+                     reproduce the traffic again, or use `network har start` for full bodies"
+                );
             } else {
                 for req in requests {
                     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
