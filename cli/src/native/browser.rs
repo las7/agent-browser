@@ -323,6 +323,10 @@ pub struct BrowserManager {
     /// True when the CDP WebSocket is already scoped to a page target and
     /// browser-level Target.* commands are not available.
     direct_page: bool,
+    /// True when this manager launched its own headless Chrome. Window-state
+    /// changes (minimize/maximize) abort headless Chrome, so those verbs are
+    /// refused up front.
+    pub headless: bool,
 }
 
 const LIGHTPANDA_CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -356,6 +360,7 @@ impl BrowserManager {
         }
 
         let ignore_https_errors = options.ignore_https_errors;
+        let headless = options.headless;
         let user_agent = options.user_agent.clone();
         let color_scheme = options.color_scheme.clone();
         let download_path = options.download_path.clone();
@@ -416,6 +421,7 @@ impl BrowserManager {
                 next_tab_id: 1,
                 named_contexts: HashMap::new(),
                 direct_page: false,
+                headless,
             };
             manager.discover_and_attach_targets().await?;
             manager
@@ -507,6 +513,9 @@ impl BrowserManager {
             next_tab_id: 1,
             named_contexts: HashMap::new(),
             direct_page,
+            // Connected to an externally launched browser: window-state
+            // support is unknown, don't restrict it.
+            headless: false,
         };
 
         if direct_page {
@@ -1851,6 +1860,7 @@ async fn initialize_lightpanda_manager(
             next_tab_id: 1,
             named_contexts: HashMap::new(),
             direct_page: false,
+            headless: true,
         };
 
         match discover_and_attach_lightpanda_targets(&mut manager, deadline).await {
