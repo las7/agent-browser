@@ -227,6 +227,8 @@ struct DrainedEvents {
     attached_other_sessions: Vec<String>,
     /// Session IDs from Target.detachedFromTarget.
     detached_iframe_sessions: Vec<String>,
+    /// Target IDs from Target.targetCrashed.
+    crashed_targets: Vec<String>,
     /// (request_id, event session_id) pairs from `Network.loadingFinished`
     /// while HAR recording; bodies are fetched for these in
     /// `apply_drained_events` before Chrome evicts them (e.g. on navigation).
@@ -412,6 +414,13 @@ pub struct DaemonState {
     pub journal: Option<Arc<Journal>>,
     /// Background task that tees CDP events into the journal.
     journal_handler_task: Option<tokio::task::JoinHandle<()>>,
+    /// One-shot notices about tab-level events the agent did not initiate
+    /// (popup opened, active tab crashed/closed, browser relaunched).
+    /// Drained into the `notices` field of the next response.
+    pub pending_notices: Vec<String>,
+    /// (signature, page_count) of the tab list as of the last response, used
+    /// to render the tab list into responses only when it changed.
+    last_tabs_state: Option<(u64, usize)>,
 }
 
 impl DaemonState {
@@ -499,6 +508,8 @@ impl DaemonState {
             confirmed_policy_actions: HashSet::new(),
             journal,
             journal_handler_task: None,
+            pending_notices: Vec::new(),
+            last_tabs_state: None,
         }
     }
 
@@ -895,6 +906,20 @@ impl DaemonState {
             }
         }
 
+        // Mark crashed targets so `tab list` can render them
+        for target_id in &drained.crashed_targets {
+            if let Some(ref mut mgr) = self.browser {
+                if let Some((tab_id, was_active)) = mgr.mark_crashed(target_id) {
+                    if was_active {
+                        self.pending_notices.push(format!(
+                            "Active tab {} crashed; `reload` to revive it or switch with `tab <ref>`",
+                            super::browser::format_tab_id(tab_id)
+                        ));
+                    }
+                }
+            }
+        }
+
         // Track cross-origin iframe sessions
         for (frame_id, iframe_sid) in &drained.attached_iframe_sessions {
             self.iframe_sessions
@@ -985,6 +1010,11 @@ impl DaemonState {
                             url: page_url,
                             title: target_info.title.clone(),
                             target_type: target_info.target_type.clone(),
+                            parent_tab_id: target_info
+                                .opener_id
+                                .as_deref()
+                                .and_then(|o| mgr.tab_id_for_target(o)),
+                            crashed: false,
                         });
                     }
 
@@ -1111,6 +1141,12 @@ impl DaemonState {
                         url: page_url,
                         title: te.target_info.title.clone(),
                         target_type: te.target_info.target_type.clone(),
+                        parent_tab_id: te
+                            .target_info
+                            .opener_id
+                            .as_deref()
+                            .and_then(|o| mgr.tab_id_for_target(o)),
+                        crashed: false,
                     });
                     mgr.resume_if_waiting_pub(&attach.session_id).await
                 }
@@ -1228,6 +1264,7 @@ impl DaemonState {
         let mut attached_worker_sessions: Vec<(TargetInfo, String)> = Vec::new();
         let mut attached_other_sessions: Vec<String> = Vec::new();
         let mut detached_iframe_sessions: Vec<String> = Vec::new();
+        let mut crashed_targets: Vec<String> = Vec::new();
         let mut har_finished_requests: Vec<(String, Option<String>)> = Vec::new();
 
         loop {
@@ -1322,6 +1359,13 @@ impl DaemonState {
                                 event.params.get("sessionId").and_then(|v| v.as_str())
                             {
                                 detached_iframe_sessions.push(sid.to_string());
+                            }
+                            continue;
+                        }
+                        "Target.targetCrashed" => {
+                            if let Some(tid) = event.params.get("targetId").and_then(|v| v.as_str())
+                            {
+                                crashed_targets.push(tid.to_string());
                             }
                             continue;
                         }
@@ -1682,6 +1726,7 @@ impl DaemonState {
             attached_worker_sessions,
             attached_other_sessions,
             detached_iframe_sessions,
+            crashed_targets,
             har_finished_requests,
         }
     }
@@ -2520,6 +2565,41 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                     )),
                 );
             }
+        }
+    }
+
+    // Tab-list-on-change: render the tab list into any response whenever it
+    // changed since the last response and more than one tab is (or was)
+    // involved — the agent should never have to poll `tab list` to notice a
+    // popup, a closed tab, or a crash. Journaled on every change so external
+    // consumers can mirror tab state without polling.
+    if let Some(ref mgr) = state.browser {
+        let signature = mgr.tabs_signature();
+        let count = mgr.page_count();
+        if state.last_tabs_state != Some((signature, count)) {
+            if let Some(ref journal) = state.journal {
+                journal.write(json!({
+                    "type": "tabs",
+                    "tabs": mgr.tab_list(),
+                }));
+            }
+            let prev_count = state.last_tabs_state.map(|(_, c)| c).unwrap_or(count);
+            if (count > 1 || prev_count > 1)
+                && !matches!(action, "tab_list" | "tab_new" | "tab_switch" | "tab_close")
+            {
+                if let Some(obj) = resp.as_object_mut() {
+                    obj.insert("tabs".to_string(), json!(mgr.tab_list()));
+                }
+            }
+            state.last_tabs_state = Some((signature, count));
+        }
+    }
+
+    // Deliver one-shot notices (popup opened, tab crashed/closed, relaunch).
+    if !state.pending_notices.is_empty() {
+        let notices: Vec<String> = state.pending_notices.drain(..).collect();
+        if let Some(obj) = resp.as_object_mut() {
+            obj.insert("notices".to_string(), json!(notices));
         }
     }
 
@@ -6445,6 +6525,8 @@ async fn handle_recording_start(cmd: &Value, state: &mut DaemonState) -> Result<
             url: "about:blank".to_string(),
             title: String::new(),
             target_type: "page".to_string(),
+            parent_tab_id: None,
+            crashed: false,
         });
 
         (mgr.client.clone(), new_session_id, nav_url)
@@ -8732,6 +8814,8 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
             url: "about:blank".to_string(),
             title: String::new(),
             target_type: "page".to_string(),
+            parent_tab_id: None,
+            crashed: false,
         });
         (tab_id, attach.session_id)
     };
@@ -12140,6 +12224,8 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
                 url: "about:blank".to_string(),
                 title: String::new(),
                 target_type: "page".to_string(),
+                parent_tab_id: None,
+                crashed: false,
             },
             super::super::browser::PageInfo {
                 tab_id: 2,
@@ -12149,6 +12235,8 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
                 url: "about:blank".to_string(),
                 title: String::new(),
                 target_type: "page".to_string(),
+                parent_tab_id: None,
+                crashed: false,
             },
             super::super::browser::PageInfo {
                 tab_id: 3,
@@ -12158,6 +12246,8 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
                 url: "about:blank".to_string(),
                 title: String::new(),
                 target_type: "page".to_string(),
+                parent_tab_id: None,
+                crashed: false,
             },
         ];
 
@@ -12177,6 +12267,8 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             url: String::new(),
             title: String::new(),
             target_type: "page".to_string(),
+            parent_tab_id: None,
+            crashed: false,
         }];
 
         assert_eq!(
