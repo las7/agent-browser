@@ -171,7 +171,11 @@ impl Journal {
                 inner.file = None;
                 return;
             }
-            match OpenOptions::new().create(true).append(true).open(&self.path) {
+            match OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+            {
                 Ok(f) => {
                     inner.file = Some(f);
                     inner.bytes = 0;
@@ -303,11 +307,7 @@ pub fn record_cdp_event(journal: &Journal, event: &CdpEvent) {
                 .and_then(|d| d.get("exception"))
                 .and_then(|e| e.get("description"))
                 .and_then(|v| v.as_str())
-                .or_else(|| {
-                    details
-                        .and_then(|d| d.get("text"))
-                        .and_then(|v| v.as_str())
-                })
+                .or_else(|| details.and_then(|d| d.get("text")).and_then(|v| v.as_str()))
                 .unwrap_or("");
             let mut record = json!({
                 "type": "page_error",
